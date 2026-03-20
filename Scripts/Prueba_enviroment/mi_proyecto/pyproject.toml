@@ -1,0 +1,25 @@
+[project]
+name = "mi-proyecto"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Nicolás Bohn",email = "123598922+Nico5011@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas (>=3.0.1,<4.0.0)",
+    "matplotlib (>=3.10.8,<4.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "mi_proyecto", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)"
+]

@@ -15,3 +15,9 @@
 *.joblib
 
 /work/optuna_artifacts/
+
+# Ignoro archivos caches
+
+__pycache__/
+*.pyc
+.pytest_cache/
