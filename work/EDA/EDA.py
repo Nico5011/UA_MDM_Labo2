@@ -5,7 +5,7 @@ import matplotlib
 import pandas as pd
 import seaborn as sns
 
-# Backend no interactivo para entornos sin UI.
+# Backend no interactivo para entornos sin UI. 1
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
