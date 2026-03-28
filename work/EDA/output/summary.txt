@@ -1,0 +1,23 @@
+=== EDA - PETFINDER TRAIN ===
+Filas: 14993
+Columnas: 24
+Columnas numericas: 20
+Columnas categoricas: 4
+Filas duplicadas: 0
+
+Top 15 columnas con mayor porcentaje de nulos:
+- Name: 8.44%
+- Description: 0.09%
+- Type: 0.00%
+- PhotoAmt: 0.00%
+- PetID: 0.00%
+- VideoAmt: 0.00%
+- RescuerID: 0.00%
+- State: 0.00%
+- Fee: 0.00%
+- Quantity: 0.00%
+- Health: 0.00%
+- Sterilized: 0.00%
+- Dewormed: 0.00%
+- Vaccinated: 0.00%
+- FurLength: 0.00%
