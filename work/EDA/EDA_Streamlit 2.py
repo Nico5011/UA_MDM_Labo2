@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -1200,6 +1201,31 @@ def load_uploaded_csv(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_reference_table_from_path(file_path: str) -> pd.DataFrame:
+    path = Path(file_path)
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_reference_table_from_upload(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    if file_name.lower().endswith(".parquet"):
+        return pd.read_parquet(pd.io.common.BytesIO(file_bytes))
+    return pd.read_csv(pd.io.common.BytesIO(file_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def load_geojson_from_path(file_path: str) -> dict:
+    return json.loads(Path(file_path).read_text(encoding="utf-8"))
+
+
+@st.cache_data(show_spinner=False)
+def load_geojson_from_upload(file_bytes: bytes) -> dict:
+    return json.loads(file_bytes.decode("utf-8"))
+
+
 def get_available_local_files() -> list[dict]:
     files = []
     seen_paths = set()
@@ -1244,6 +1270,27 @@ def get_available_local_files() -> list[dict]:
                         "type": file.suffix.lower().replace(".", "").upper(),
                     }
                 )
+
+    return files
+
+
+def get_available_geojson_files() -> list[dict]:
+    files = []
+    seen_paths = set()
+
+    for input_dir in INPUT_DIRS:
+        if not input_dir.exists():
+            continue
+        for file in sorted(input_dir.rglob("*")):
+            resolved = file.resolve()
+            if not file.is_file() or file.suffix.lower() not in {".json", ".geojson"} or resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            try:
+                label = str(file.relative_to(REPO_ROOT))
+            except ValueError:
+                label = str(file.relative_to(BASE_DIR))
+            files.append({"label": label, "path": file})
 
     return files
 
@@ -1573,8 +1620,9 @@ def fig_box_by_category(df: pd.DataFrame, numeric_col: str, category_col: str) -
 
 
 def fig_time_series(df: pd.DataFrame, datetime_col: str) -> go.Figure:
+    datetime_series = coerce_datetime_series(df[datetime_col])
     timeline = (
-        df[datetime_col]
+        datetime_series
         .dropna()
         .dt.to_period("M")
         .astype(str)
@@ -1597,6 +1645,8 @@ def fig_time_series_metric(
     agg_func: str = "sum",
 ) -> go.Figure:
     base = df[[datetime_col] + ([value_col] if value_col else [])].dropna(subset=[datetime_col]).copy()
+    base[datetime_col] = coerce_datetime_series(base[datetime_col])
+    base = base.dropna(subset=[datetime_col])
     if base.empty:
         return go.Figure()
 
@@ -1856,28 +1906,34 @@ def coerce_datetime_series(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce")
 
 
-def fig_map(df: pd.DataFrame, size_map: str) -> go.Figure:
-    schema = infer_schema(df)
-    lat_col = schema["lat_col"]
-    lon_col = schema["lon_col"]
-    category_col = schema["primary_category"]
-    hover_name = schema["id_col"] or (df.columns[0] if len(df.columns) else None)
-
-    map_df = df[df["TIENE_COORDENADAS"]].copy()
-    if map_df.empty or not lat_col or not lon_col:
+def fig_map_coordinates(
+    df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    size_col: str,
+    color_col: str,
+    hover_name: str | None,
+) -> go.Figure:
+    map_df = df.copy()
+    map_df[lat_col] = pd.to_numeric(map_df[lat_col], errors="coerce")
+    map_df[lon_col] = pd.to_numeric(map_df[lon_col], errors="coerce")
+    map_df = map_df.dropna(subset=[lat_col, lon_col])
+    if map_df.empty:
         return go.Figure()
 
-    if size_map == "Constante" or size_map not in map_df.columns:
+    if size_col == "Constante" or size_col not in map_df.columns:
         map_df["SIZE_VALUE"] = 10
     else:
-        base = map_df[size_map].fillna(map_df[size_map].median())
+        base = pd.to_numeric(map_df[size_col], errors="coerce")
+        fill_value = float(base.dropna().median()) if base.notna().any() else 0.0
+        base = base.fillna(fill_value)
         map_df["SIZE_VALUE"] = 10 if float(base.max()) == float(base.min()) else 8 + ((base - base.min()) / (base.max() - base.min()) * 20)
 
-    hover_columns = [column for column in [hover_name, category_col, lat_col, lon_col, size_map] if column and column in map_df.columns]
+    hover_columns = [column for column in [hover_name, color_col, lat_col, lon_col, size_col] if column and column in map_df.columns]
     hover_data = {column: True for column in hover_columns if column != hover_name}
     hover_data["SIZE_VALUE"] = False
 
-    color_arg = category_col if category_col in map_df.columns else None
+    color_arg = color_col if color_col != "Sin color" and color_col in map_df.columns else None
     fig = px.scatter_map(
         map_df,
         lat=lat_col,
@@ -1885,15 +1941,181 @@ def fig_map(df: pd.DataFrame, size_map: str) -> go.Figure:
         color=color_arg,
         size="SIZE_VALUE",
         size_max=26,
-        hover_name=hover_name if hover_name in map_df.columns else None,
+        hover_name=hover_name if hover_name and hover_name in map_df.columns else None,
         hover_data=hover_data,
-        zoom=6.3,
+        zoom=3.5,
         height=720,
         color_discrete_sequence=PALETTE,
         title=f"Distribucion espacial ({lat_col}, {lon_col})",
     )
     fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     return fig
+
+
+def fig_map_locations(
+    df: pd.DataFrame,
+    location_col: str,
+    location_mode: str,
+    color_col: str,
+    hover_name: str | None,
+) -> go.Figure:
+    base = df.copy()
+    base[location_col] = base[location_col].fillna("").astype(str).str.strip()
+    base = base[base[location_col] != ""]
+    if base.empty:
+        return go.Figure()
+
+    if color_col != "Conteo" and color_col in base.columns:
+        values = pd.to_numeric(base[color_col], errors="coerce")
+        base = base.assign(_map_value=values).dropna(subset=["_map_value"])
+        if base.empty:
+            return go.Figure()
+        grouped = base.groupby(location_col, as_index=False)["_map_value"].mean()
+        grouped = grouped.rename(columns={"_map_value": "Valor"})
+        title = f"Mapa por ubicacion usando {location_col} y media de {color_col}"
+    else:
+        grouped = base.groupby(location_col, as_index=False).size().rename(columns={"size": "Valor"})
+        title = f"Mapa por ubicacion usando {location_col}"
+
+    fig = px.choropleth(
+        grouped,
+        locations=location_col,
+        color="Valor",
+        locationmode=location_mode,
+        color_continuous_scale="Turbo",
+        hover_name=location_col,
+        height=720,
+        title=title,
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=60, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        geo=dict(bgcolor="rgba(0,0,0,0)", showframe=False, showcoastlines=True, coastlinecolor="rgba(148,163,184,0.3)"),
+    )
+    return fig
+
+
+def fig_map_geojson(
+    df: pd.DataFrame,
+    location_col: str,
+    value_col: str,
+    geojson_data: dict,
+    feature_property: str,
+    hover_name: str | None,
+) -> go.Figure:
+    base = df.copy()
+    base[location_col] = base[location_col].fillna("").astype(str).str.strip()
+    base = base[base[location_col] != ""]
+    if base.empty:
+        return go.Figure()
+
+    if value_col != "Conteo" and value_col in base.columns:
+        metric_series = pd.to_numeric(base[value_col], errors="coerce")
+        base = base.assign(MAP_VALUE=metric_series).dropna(subset=["MAP_VALUE"])
+        grouped = base.groupby(location_col, as_index=False)["MAP_VALUE"].mean().rename(columns={"MAP_VALUE": "Valor"})
+    else:
+        grouped = base.groupby(location_col, as_index=False).size().rename(columns={"size": "Valor"})
+
+    features = geojson_data.get("features", [])
+    if not features:
+        return go.Figure()
+
+    geometry_types = {feature.get("geometry", {}).get("type") for feature in features if feature.get("geometry")}
+    point_only = geometry_types and geometry_types.issubset({"Point", "MultiPoint"})
+
+    if point_only:
+        rows = []
+        for feature in features:
+            properties = feature.get("properties", {})
+            geometry = feature.get("geometry", {})
+            coords = geometry.get("coordinates", [])
+            if geometry.get("type") != "Point" or len(coords) < 2:
+                continue
+            rows.append(
+                {
+                    "GeoKey": str(properties.get(feature_property, "")).strip(),
+                    "lon": coords[0],
+                    "lat": coords[1],
+                }
+            )
+        geo_df = pd.DataFrame(rows)
+        if geo_df.empty:
+            return go.Figure()
+        merged = grouped.merge(geo_df, left_on=location_col, right_on="GeoKey", how="inner")
+        if merged.empty:
+            return go.Figure()
+        merged["SIZE_VALUE"] = 10 if merged["Valor"].nunique() <= 1 else 8 + ((merged["Valor"] - merged["Valor"].min()) / (merged["Valor"].max() - merged["Valor"].min()) * 20)
+        fig = px.scatter_geo(
+            merged,
+            lat="lat",
+            lon="lon",
+            size="SIZE_VALUE",
+            color="Valor",
+            hover_name=location_col if hover_name is None or hover_name not in merged.columns else hover_name,
+            hover_data={location_col: True, "Valor": True, "SIZE_VALUE": False},
+            color_continuous_scale="Turbo",
+            projection="natural earth",
+            height=720,
+            title=f"Mapa con GeoJSON usando {location_col}",
+        )
+        fig.update_geos(bgcolor="rgba(0,0,0,0)", showcoastlines=True, coastlinecolor="rgba(148,163,184,0.3)")
+        fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+
+    fig = px.choropleth(
+        grouped,
+        geojson=geojson_data,
+        locations=location_col,
+        featureidkey=f"properties.{feature_property}",
+        color="Valor",
+        color_continuous_scale="Turbo",
+        hover_name=location_col,
+        height=720,
+        title=f"Mapa con GeoJSON usando {location_col}",
+    )
+    fig.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(margin=dict(l=0, r=0, t=60, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def location_mode_diagnostics(series: pd.Series, location_mode: str) -> dict:
+    values = series.dropna().astype(str).str.strip()
+    values = values[values != ""]
+    sample = values.drop_duplicates().head(8).tolist()
+    if values.empty:
+        return {"valid": False, "message": "La columna no tiene ubicaciones utilizables.", "sample": sample}
+
+    alpha_ratio = values.str.contains(r"[A-Za-z]", regex=True).mean()
+    digit_ratio = values.str.fullmatch(r"\d+").mean()
+
+    if location_mode == "USA-states":
+        valid_ratio = values.str.fullmatch(r"[A-Za-z]{2}").mean()
+        valid = valid_ratio >= 0.7
+        message = "Se esperan abreviaturas de 2 letras como CA, TX o NY."
+    elif location_mode == "ISO-3":
+        valid_ratio = values.str.fullmatch(r"[A-Za-z]{3}").mean()
+        valid = valid_ratio >= 0.7
+        message = "Se esperan codigos ISO-3 de 3 letras como ARG, USA o BRA."
+    else:
+        valid = alpha_ratio >= 0.5 and digit_ratio < 0.5
+        valid_ratio = alpha_ratio
+        message = "Se esperan nombres de paises como Argentina, Brazil o United States."
+
+    if digit_ratio >= 0.7:
+        message = (
+            "La columna parece contener codigos numericos o IDs internos. "
+            "Plotly no los puede ubicar automaticamente como paises o estados."
+        )
+        valid = False
+
+    return {
+        "valid": bool(valid),
+        "valid_ratio": float(valid_ratio),
+        "digit_ratio": float(digit_ratio),
+        "message": message,
+        "sample": sample,
+    }
 
 
 def get_relation_columns(df: pd.DataFrame) -> list[str]:
@@ -2401,33 +2623,278 @@ def render_statistics_tab(df: pd.DataFrame) -> None:
     )
 
 
-def render_map_tab(df: pd.DataFrame, size_map: str) -> None:
+def render_map_tab(df: pd.DataFrame, size_map: str, local_files: list[dict] | None = None) -> None:
     schema = infer_schema(df)
-    if not schema["lat_col"] or not schema["lon_col"]:
-        st.info("Este dataset no tiene columnas de coordenadas detectables automaticamente.")
-        return
+    all_cols = list(df.columns)
+    numeric_options = ["Constante"] + schema["numeric_cols"]
+    categorical_options = ["Sin color"] + schema["categorical_cols"]
+    location_modes = ["country names", "ISO-3", "USA-states"]
+    local_files = local_files or []
+    geojson_files = get_available_geojson_files()
 
-    map_df = df[df["TIENE_COORDENADAS"]]
-    if map_df.empty:
-        st.warning("No hay coordenadas disponibles bajo la combinacion actual de filtros.")
-        return
-
-    st.caption(f"Mapa construido con {schema['lat_col']} y {schema['lon_col']}.")
-    st.plotly_chart(fig_map(df, size_map), use_container_width=True, key=f"map_{size_map}")
-
-    summary = pd.DataFrame(
-        {
-            "Metrica": ["Registros mapeados", f"Min {schema['lat_col']}", f"Max {schema['lat_col']}", f"Min {schema['lon_col']}", f"Max {schema['lon_col']}"],
-            "Valor": [
-                fmt_int(len(map_df)),
-                fmt_num(map_df[schema["lat_col"]].min(), 4),
-                fmt_num(map_df[schema["lat_col"]].max(), 4),
-                fmt_num(map_df[schema["lon_col"]].min(), 4),
-                fmt_num(map_df[schema["lon_col"]].max(), 4),
-            ],
-        }
+    lat_default = schema["lat_col"] if schema["lat_col"] in all_cols else None
+    lon_default = schema["lon_col"] if schema["lon_col"] in all_cols else None
+    location_default = next(
+        (
+            col for col in all_cols
+            if any(token in _normalized(col) for token in ["STATE", "PAIS", "COUNTRY", "REGION", "PROV"])
+        ),
+        all_cols[0] if all_cols else None,
     )
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    applied_key = "applied_map_settings"
+    default_settings = {
+        "mode": "Lat/Lon" if lat_default and lon_default else "Ubicaciones",
+        "lat_col": lat_default,
+        "lon_col": lon_default,
+        "size_col": size_map if size_map in numeric_options else "Constante",
+        "color_col": schema["primary_category"] if schema["primary_category"] in schema["categorical_cols"] else "Sin color",
+        "hover_name": schema["id_col"] if schema["id_col"] in all_cols else (all_cols[0] if all_cols else None),
+        "location_col": location_default,
+        "location_mode": "USA-states" if location_default and "STATE" in _normalized(location_default) else "country names",
+        "location_value_col": "Conteo",
+    }
+    if applied_key not in st.session_state:
+        st.session_state[applied_key] = default_settings.copy()
+
+    dictionary_files = [item for item in local_files if item["type"] in {"CSV", "PARQUET"}]
+
+    with st.form("map_settings_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        mode = c1.selectbox("Tipo de mapa", options=["Lat/Lon", "Ubicaciones"], index=["Lat/Lon", "Ubicaciones"].index(st.session_state[applied_key].get("mode", default_settings["mode"])))
+        hover_options = ["Sin etiqueta"] + all_cols
+
+        if mode == "Lat/Lon":
+            lat_idx = all_cols.index(st.session_state[applied_key].get("lat_col")) if st.session_state[applied_key].get("lat_col") in all_cols else 0
+            lon_idx = all_cols.index(st.session_state[applied_key].get("lon_col")) if st.session_state[applied_key].get("lon_col") in all_cols else 0
+            size_idx = numeric_options.index(st.session_state[applied_key].get("size_col", "Constante")) if st.session_state[applied_key].get("size_col", "Constante") in numeric_options else 0
+            color_idx = categorical_options.index(st.session_state[applied_key].get("color_col", "Sin color")) if st.session_state[applied_key].get("color_col", "Sin color") in categorical_options else 0
+
+            lat_col = c2.selectbox("Latitud", options=all_cols, index=lat_idx)
+            lon_col = c3.selectbox("Longitud", options=all_cols, index=lon_idx)
+            size_col = c4.selectbox("Tamano", options=numeric_options, index=size_idx)
+            map_color_col = st.selectbox("Color", options=categorical_options, index=color_idx)
+            hover_idx = hover_options.index(st.session_state[applied_key].get("hover_name")) if st.session_state[applied_key].get("hover_name") in hover_options else 0
+            hover_name = st.selectbox("Etiqueta hover", options=hover_options, index=hover_idx)
+            submitted = st.form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
+            if submitted:
+                st.session_state[applied_key] = {
+                    "mode": mode,
+                    "lat_col": lat_col,
+                    "lon_col": lon_col,
+                    "size_col": size_col,
+                    "color_col": map_color_col,
+                    "hover_name": None if hover_name == "Sin etiqueta" else hover_name,
+                    "location_col": st.session_state[applied_key].get("location_col"),
+                    "location_mode": st.session_state[applied_key].get("location_mode", "country names"),
+                    "location_value_col": st.session_state[applied_key].get("location_value_col", "Conteo"),
+                }
+                st.rerun()
+        else:
+            location_idx = all_cols.index(st.session_state[applied_key].get("location_col")) if st.session_state[applied_key].get("location_col") in all_cols else 0
+            mode_idx = location_modes.index(st.session_state[applied_key].get("location_mode", "country names")) if st.session_state[applied_key].get("location_mode", "country names") in location_modes else 0
+            value_options = ["Conteo"] + schema["numeric_cols"]
+            value_idx = value_options.index(st.session_state[applied_key].get("location_value_col", "Conteo")) if st.session_state[applied_key].get("location_value_col", "Conteo") in value_options else 0
+            hover_idx = hover_options.index(st.session_state[applied_key].get("hover_name")) if st.session_state[applied_key].get("hover_name") in hover_options else 0
+
+            location_col = c2.selectbox("Ubicacion", options=all_cols, index=location_idx)
+            location_mode = c3.selectbox("Modo de ubicacion", options=location_modes, index=mode_idx)
+            location_value_col = c4.selectbox("Valor", options=value_options, index=value_idx)
+            hover_name = st.selectbox("Etiqueta hover", options=hover_options, index=hover_idx)
+            submitted = st.form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
+            if submitted:
+                st.session_state[applied_key] = {
+                    "mode": mode,
+                    "lat_col": st.session_state[applied_key].get("lat_col"),
+                    "lon_col": st.session_state[applied_key].get("lon_col"),
+                    "size_col": st.session_state[applied_key].get("size_col", "Constante"),
+                    "color_col": st.session_state[applied_key].get("color_col", "Sin color"),
+                    "hover_name": None if hover_name == "Sin etiqueta" else hover_name,
+                    "location_col": location_col,
+                    "location_mode": location_mode,
+                    "location_value_col": location_value_col,
+                }
+                st.rerun()
+
+    settings = st.session_state[applied_key]
+
+    map_dictionary_df = None
+    dictionary_expander = st.expander("Diccionario de ubicaciones opcional", expanded=False)
+    with dictionary_expander:
+        use_dictionary = st.checkbox("Usar diccionario para traducir codigos", key="map_use_dictionary")
+        if use_dictionary:
+            dict_source = st.radio("Fuente del diccionario", options=["Archivo local", "Subir archivo"], key="map_dictionary_source", horizontal=True)
+            if dict_source == "Archivo local":
+                if dictionary_files:
+                    dict_labels = [item["label"] for item in dictionary_files]
+                    default_dict_label = next(
+                        (label for label in dict_labels if "state" in label.lower() or "label" in label.lower()),
+                        dict_labels[0],
+                    )
+                    selected_dict_label = st.selectbox("Archivo de diccionario", options=dict_labels, index=dict_labels.index(default_dict_label), key="map_dictionary_local_file")
+                    selected_dict_item = next(item for item in dictionary_files if item["label"] == selected_dict_label)
+                    map_dictionary_df = load_reference_table_from_path(str(selected_dict_item["path"]))
+                else:
+                    st.info("No hay archivos locales disponibles para usar como diccionario.")
+            else:
+                uploaded_dict = st.file_uploader("Sube el diccionario CSV o parquet", type=["csv", "parquet"], key="map_dictionary_upload")
+                if uploaded_dict is not None:
+                    map_dictionary_df = load_reference_table_from_upload(uploaded_dict.getvalue(), uploaded_dict.name)
+
+            if map_dictionary_df is not None and not map_dictionary_df.empty:
+                dict_columns = list(map_dictionary_df.columns)
+                default_key_col = next((col for col in dict_columns if any(token in _normalized(col) for token in ["ID", "COD", "CODE", "KEY"])), dict_columns[0])
+                default_value_col = next((col for col in dict_columns if col != default_key_col and any(token in _normalized(col) for token in ["NAME", "DESC", "STATE", "PAIS", "COUNTRY", "REGION"])), dict_columns[min(1, len(dict_columns) - 1)])
+                dict_key_col = st.selectbox("Columna clave del diccionario", options=dict_columns, index=dict_columns.index(default_key_col), key="map_dictionary_key_col")
+                dict_value_col = st.selectbox("Columna descriptiva del diccionario", options=dict_columns, index=dict_columns.index(default_value_col), key="map_dictionary_value_col")
+                st.caption(f"Ejemplo de traduccion: `{dict_key_col}` -> `{dict_value_col}`")
+            elif use_dictionary:
+                st.caption("Selecciona o sube un diccionario para poder traducir codigos a nombres.")
+
+    selected_geojson = None
+    selected_geojson_property = None
+    geojson_expander = st.expander("GeoJSON opcional", expanded=False)
+    with geojson_expander:
+        use_geojson = st.checkbox("Usar GeoJSON para dibujar ubicaciones", key="map_use_geojson")
+        if use_geojson:
+            geojson_source = st.radio("Fuente del GeoJSON", options=["Archivo local", "Subir archivo"], key="map_geojson_source", horizontal=True)
+            if geojson_source == "Archivo local":
+                if geojson_files:
+                    geojson_labels = [item["label"] for item in geojson_files]
+                    default_geojson = next((label for label in geojson_labels if "malaysia" in label.lower() or "state" in label.lower()), geojson_labels[0])
+                    selected_geojson_label = st.selectbox("Archivo GeoJSON", options=geojson_labels, index=geojson_labels.index(default_geojson), key="map_geojson_local_file")
+                    selected_geojson_item = next(item for item in geojson_files if item["label"] == selected_geojson_label)
+                    selected_geojson = load_geojson_from_path(str(selected_geojson_item["path"]))
+                else:
+                    st.info("No hay archivos `.json` o `.geojson` disponibles en las carpetas de entrada.")
+            else:
+                uploaded_geojson = st.file_uploader("Sube un archivo GeoJSON", type=["json", "geojson"], key="map_geojson_upload")
+                if uploaded_geojson is not None:
+                    selected_geojson = load_geojson_from_upload(uploaded_geojson.getvalue())
+
+            if selected_geojson and selected_geojson.get("features"):
+                first_properties = selected_geojson["features"][0].get("properties", {})
+                property_options = list(first_properties.keys()) if first_properties else []
+                if property_options:
+                    default_property = next((prop for prop in property_options if any(token in _normalized(prop) for token in ["NAME", "STATE", "REGION", "ID", "CODE"])), property_options[0])
+                    selected_geojson_property = st.selectbox("Propiedad del feature para hacer match", options=property_options, index=property_options.index(default_property), key="map_geojson_property")
+                    st.caption(f"Se comparara la columna de ubicacion elegida contra `properties.{selected_geojson_property}`.")
+                else:
+                    st.warning("El GeoJSON no tiene propiedades utilizables en sus features.")
+
+    if settings["mode"] == "Lat/Lon":
+        lat_col = settings.get("lat_col")
+        lon_col = settings.get("lon_col")
+        if not lat_col or not lon_col:
+            st.info("Selecciona las columnas de latitud y longitud para construir el mapa.")
+            return
+
+        map_df = df.copy()
+        map_df[lat_col] = pd.to_numeric(map_df[lat_col], errors="coerce")
+        map_df[lon_col] = pd.to_numeric(map_df[lon_col], errors="coerce")
+        map_df = map_df.dropna(subset=[lat_col, lon_col])
+        if map_df.empty:
+            st.warning("No hay coordenadas validas para las columnas elegidas.")
+            return
+
+        st.caption(f"Mapa construido con latitud `{lat_col}` y longitud `{lon_col}`.")
+        st.plotly_chart(
+            fig_map_coordinates(df, lat_col, lon_col, settings.get("size_col", "Constante"), settings.get("color_col", "Sin color"), settings.get("hover_name")),
+            use_container_width=True,
+            key=f"map_coords_{lat_col}_{lon_col}_{settings.get('size_col')}_{settings.get('color_col')}",
+        )
+
+        summary = pd.DataFrame(
+            {
+                "Metrica": ["Registros mapeados", f"Min {lat_col}", f"Max {lat_col}", f"Min {lon_col}", f"Max {lon_col}"],
+                "Valor": [
+                    fmt_int(len(map_df)),
+                    fmt_num(map_df[lat_col].min(), 4),
+                    fmt_num(map_df[lat_col].max(), 4),
+                    fmt_num(map_df[lon_col].min(), 4),
+                    fmt_num(map_df[lon_col].max(), 4),
+                ],
+            }
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+    else:
+        location_col = settings.get("location_col")
+        if not location_col:
+            st.info("Selecciona la columna geografica para construir el mapa.")
+            return
+
+        location_df = df.copy()
+        location_df[location_col] = location_df[location_col].fillna("").astype(str).str.strip()
+        location_df = location_df[location_df[location_col] != ""]
+        if location_df.empty:
+            st.warning("No hay ubicaciones validas en la columna elegida.")
+            return
+
+        location_display_col = location_col
+        if st.session_state.get("map_use_dictionary") and map_dictionary_df is not None and not map_dictionary_df.empty:
+            dict_key_col = st.session_state.get("map_dictionary_key_col")
+            dict_value_col = st.session_state.get("map_dictionary_value_col")
+            if dict_key_col in map_dictionary_df.columns and dict_value_col in map_dictionary_df.columns:
+                dictionary_map = (
+                    map_dictionary_df[[dict_key_col, dict_value_col]]
+                    .dropna()
+                    .assign(
+                        __dict_key=lambda frame: frame[dict_key_col].astype(str).str.strip(),
+                        __dict_value=lambda frame: frame[dict_value_col].astype(str).str.strip(),
+                    )
+                    .drop_duplicates(subset="__dict_key")
+                    .set_index("__dict_key")["__dict_value"]
+                    .to_dict()
+                )
+                location_df["MAP_LOCATION_LABEL"] = location_df[location_col].astype(str).str.strip().map(dictionary_map)
+                match_ratio = location_df["MAP_LOCATION_LABEL"].notna().mean()
+                st.caption(f"Diccionario aplicado sobre `{location_col}`. Cobertura: {pct(match_ratio * 100)}.")
+                location_df["MAP_LOCATION_LABEL"] = location_df["MAP_LOCATION_LABEL"].fillna(location_df[location_col].astype(str).str.strip())
+                location_display_col = "MAP_LOCATION_LABEL"
+
+        if st.session_state.get("map_use_geojson") and selected_geojson and selected_geojson_property:
+            st.caption(
+                f"Mapa construido con la columna `{location_display_col}` y el GeoJSON usando `properties.{selected_geojson_property}`."
+            )
+            st.plotly_chart(
+                fig_map_geojson(
+                    location_df,
+                    location_display_col,
+                    settings.get("location_value_col", "Conteo"),
+                    selected_geojson,
+                    selected_geojson_property,
+                    settings.get("hover_name"),
+                ),
+                use_container_width=True,
+                key=f"map_geojson_{location_display_col}_{selected_geojson_property}_{settings.get('location_value_col')}",
+            )
+        else:
+            diagnostics = location_mode_diagnostics(location_df[location_display_col], settings.get("location_mode", "country names"))
+            if not diagnostics["valid"]:
+                sample_text = ", ".join(diagnostics["sample"]) if diagnostics["sample"] else "sin ejemplos"
+                st.warning(f"{diagnostics['message']} Ejemplos detectados: {sample_text}.")
+                st.caption(
+                    "Prueba otro modo de ubicacion solo si los valores realmente son nombres de paises, codigos ISO-3 o abreviaturas de estados de USA. "
+                    "Si son IDs numericos del dataset, ese campo no se puede mapear directamente sin una tabla de equivalencias."
+                )
+
+            st.caption(
+                f"Mapa construido con la columna `{location_display_col}` usando el modo `{settings.get('location_mode', 'country names')}`."
+            )
+            st.plotly_chart(
+                fig_map_locations(
+                    location_df,
+                    location_display_col,
+                    settings.get("location_mode", "country names"),
+                    settings.get("location_value_col", "Conteo"),
+                    settings.get("hover_name"),
+                ),
+                use_container_width=True,
+                key=f"map_locations_{location_display_col}_{settings.get('location_mode')}_{settings.get('location_value_col')}",
+            )
+
+        summary = location_df.groupby(location_display_col, as_index=False).size().rename(columns={"size": "Registros"}).sort_values("Registros", ascending=False).head(20)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
@@ -2498,7 +2965,7 @@ def main() -> None:
     elif active_section == "Relaciones":
         render_relations_tab(filtered, PARQUET_DIR, selected_files)
     elif active_section == "Mapa":
-        render_map_tab(filtered, size_map)
+        render_map_tab(filtered, size_map, local_files=local_files)
     elif active_section == "Datos":
         render_data_tab(filtered)
 
