@@ -1619,6 +1619,25 @@ def fig_box_by_category(df: pd.DataFrame, numeric_col: str, category_col: str) -
     return apply_dark_layout(fig)
 
 
+def fig_scatter_numeric(df: pd.DataFrame, x_col: str, y_col: str) -> go.Figure:
+    scatter_df = df[[x_col, y_col]].copy()
+    scatter_df[x_col] = pd.to_numeric(scatter_df[x_col], errors="coerce")
+    scatter_df[y_col] = pd.to_numeric(scatter_df[y_col], errors="coerce")
+    scatter_df = scatter_df.dropna(subset=[x_col, y_col])
+
+    fig = px.scatter(
+        scatter_df,
+        x=x_col,
+        y=y_col,
+        opacity=0.72,
+        color_discrete_sequence=[PRIMARY],
+        title=f"Diagrama de dispersion: {x_col} vs {y_col}",
+    )
+    fig.update_traces(marker=dict(size=8, line=dict(width=0)), selector=dict(mode="markers"))
+    fig.update_layout(height=480, xaxis_title=x_col, yaxis_title=y_col)
+    return apply_dark_layout(fig)
+
+
 def fig_time_series(df: pd.DataFrame, datetime_col: str) -> go.Figure:
     datetime_series = coerce_datetime_series(df[datetime_col])
     timeline = (
@@ -1716,7 +1735,12 @@ def temporal_breakdown_table(
     if pivot.empty:
         return pd.DataFrame()
 
-    pivot["Total"] = pivot.sum(axis=1)
+    category_columns = list(pivot.columns)
+    pivot["Total"] = pivot[category_columns].sum(axis=1)
+    pivot["Media"] = pivot[category_columns].mean(axis=1)
+    pivot["Median"] = pivot[category_columns].median(axis=1)
+    pivot["Max"] = pivot[category_columns].max(axis=1)
+    pivot["Min"] = pivot[category_columns].min(axis=1)
     pivot = pivot.sort_index().reset_index()
     return pivot
 
@@ -2240,12 +2264,12 @@ def render_executive_tab(df: pd.DataFrame) -> None:
 
 def render_numeric_tab(df: pd.DataFrame) -> None:
     schema = infer_schema(df)
-    numeric_cols = schema["numeric_cols"][:8]
+    numeric_cols = schema["numeric_cols"]
     if not numeric_cols:
         st.info("No hay columnas numericas disponibles para analisis.")
         return
 
-    category_options = ["Ninguna"] + schema["categorical_cols"][:8]
+    category_options = ["Ninguna"] + schema["categorical_cols"]
     applied_key = "applied_numeric_settings"
     if applied_key not in st.session_state:
         st.session_state[applied_key] = {"numeric": numeric_cols[0], "category": "Ninguna"}
@@ -2295,12 +2319,121 @@ def render_numeric_tab(df: pd.DataFrame) -> None:
     with c2:
         st.dataframe(df[numeric_cols].describe().T.round(2), use_container_width=True, height=470)
 
+    if "numeric_extra_enabled" not in st.session_state:
+        st.session_state["numeric_extra_enabled"] = False
+
+    toggle_cols = st.columns([0.38, 0.62])
+    if not st.session_state["numeric_extra_enabled"]:
+        if toggle_cols[0].button("Agregar grafico adicional", use_container_width=True):
+            st.session_state["numeric_extra_enabled"] = True
+            trigger_loader()
+            st.rerun()
+    else:
+        if toggle_cols[0].button("Ocultar grafico adicional", use_container_width=True):
+            st.session_state["numeric_extra_enabled"] = False
+            trigger_loader()
+            st.rerun()
+
+        extra_applied_key = "applied_numeric_extra_settings"
+        if extra_applied_key not in st.session_state:
+            default_extra_numeric = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+            st.session_state[extra_applied_key] = {"numeric": default_extra_numeric, "category": "Ninguna"}
+        if st.session_state[extra_applied_key].get("numeric") not in numeric_cols:
+            st.session_state[extra_applied_key]["numeric"] = numeric_cols[0]
+        if st.session_state[extra_applied_key].get("category") not in category_options:
+            st.session_state[extra_applied_key]["category"] = "Ninguna"
+        if "numeric_extra_primary_draft" not in st.session_state:
+            st.session_state["numeric_extra_primary_draft"] = st.session_state[extra_applied_key]["numeric"]
+        if "numeric_extra_category_draft" not in st.session_state:
+            st.session_state["numeric_extra_category_draft"] = st.session_state[extra_applied_key]["category"]
+        if st.session_state["numeric_extra_primary_draft"] not in numeric_cols:
+            st.session_state["numeric_extra_primary_draft"] = st.session_state[extra_applied_key]["numeric"]
+        if st.session_state["numeric_extra_category_draft"] not in category_options:
+            st.session_state["numeric_extra_category_draft"] = "Ninguna"
+
+        st.markdown("### Grafico adicional")
+        with st.form(key="numeric_extra_settings_form"):
+            e1, e2, e3 = st.columns([1, 1, 0.6])
+            e1.selectbox("Variable numerica adicional", options=numeric_cols, key="numeric_extra_primary_draft")
+            e2.selectbox("Variable de apertura adicional", options=category_options, key="numeric_extra_category_draft")
+            e3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+            extra_submitted = e3.form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
+
+        if extra_submitted:
+            st.session_state[extra_applied_key] = {
+                "numeric": st.session_state["numeric_extra_primary_draft"],
+                "category": st.session_state["numeric_extra_category_draft"],
+            }
+            st.rerun()
+
+        extra_numeric = st.session_state[extra_applied_key]["numeric"]
+        extra_category = st.session_state[extra_applied_key]["category"]
+        if extra_category != "Ninguna":
+            st.plotly_chart(
+                fig_box_by_category(df, extra_numeric, extra_category),
+                use_container_width=True,
+                key=f"num_box_extra_{extra_numeric}_{extra_category}",
+            )
+        else:
+            st.plotly_chart(
+                fig_distribution(df, extra_numeric),
+                use_container_width=True,
+                key=f"num_distribution_extra_{extra_numeric}",
+            )
+
     if len(numeric_cols) >= 2:
         corr = df[numeric_cols].corr(numeric_only=True)
         if not corr.empty:
             fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r", title="Matriz de correlacion")
             fig.update_layout(height=420)
             st.plotly_chart(apply_dark_layout(fig), use_container_width=True, key="num_corr")
+
+    if len(numeric_cols) < 2:
+        st.info("Se necesitan al menos dos columnas numericas para el diagrama de dispersion.")
+        return
+
+    scatter_applied_key = "applied_numeric_scatter_settings"
+    default_x = numeric_cols[0]
+    default_y = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+
+    if scatter_applied_key not in st.session_state:
+        st.session_state[scatter_applied_key] = {"x": default_x, "y": default_y}
+    if st.session_state[scatter_applied_key].get("x") not in numeric_cols:
+        st.session_state[scatter_applied_key]["x"] = default_x
+    if st.session_state[scatter_applied_key].get("y") not in numeric_cols:
+        st.session_state[scatter_applied_key]["y"] = default_y
+
+    if "numeric_scatter_x_draft" not in st.session_state:
+        st.session_state["numeric_scatter_x_draft"] = st.session_state[scatter_applied_key]["x"]
+    if "numeric_scatter_y_draft" not in st.session_state:
+        st.session_state["numeric_scatter_y_draft"] = st.session_state[scatter_applied_key]["y"]
+    if st.session_state["numeric_scatter_x_draft"] not in numeric_cols:
+        st.session_state["numeric_scatter_x_draft"] = default_x
+    if st.session_state["numeric_scatter_y_draft"] not in numeric_cols:
+        st.session_state["numeric_scatter_y_draft"] = default_y
+
+    st.markdown("### Diagrama de dispersion")
+    with st.form(key="numeric_scatter_form"):
+        s1, s2, s3 = st.columns([1, 1, 0.6])
+        s1.selectbox("Variable X", options=numeric_cols, key="numeric_scatter_x_draft")
+        s2.selectbox("Variable Y", options=numeric_cols, key="numeric_scatter_y_draft")
+        s3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+        scatter_submitted = s3.form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
+
+    if scatter_submitted:
+        st.session_state[scatter_applied_key] = {
+            "x": st.session_state["numeric_scatter_x_draft"],
+            "y": st.session_state["numeric_scatter_y_draft"],
+        }
+        st.rerun()
+
+    selected_x = st.session_state[scatter_applied_key]["x"]
+    selected_y = st.session_state[scatter_applied_key]["y"]
+    st.plotly_chart(
+        fig_scatter_numeric(df, selected_x, selected_y),
+        use_container_width=True,
+        key=f"num_scatter_{selected_x}_{selected_y}",
+    )
 
 
 def render_temporal_tab(df: pd.DataFrame) -> None:
@@ -2318,7 +2451,11 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
         "value_col": numeric_options[0] if numeric_options else None,
         "agg_func": "sum",
         "extra_col": "Sin filtro",
+        "extra_mode": "Incluir",
         "extra_values": (),
+        "extra2_col": "Sin filtro",
+        "extra2_mode": "Incluir",
+        "extra2_values": (),
     }
     if applied_key not in st.session_state:
         st.session_state[applied_key] = default_temporal.copy()
@@ -2326,9 +2463,18 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
         st.session_state[applied_key]["datetime"] = default_temporal["datetime"]
     if st.session_state[applied_key].get("value_col") not in numeric_options:
         st.session_state[applied_key]["value_col"] = default_temporal["value_col"]
-    extra_filter_options = ["Sin filtro"] + schema["categorical_cols"][:8]
+    extra_filter_options = ["Sin filtro"] + schema["categorical_cols"]
     if st.session_state[applied_key].get("extra_col") not in extra_filter_options:
         st.session_state[applied_key]["extra_col"] = "Sin filtro"
+    if st.session_state[applied_key].get("extra_mode") not in ["Incluir", "Excluir"]:
+        st.session_state[applied_key]["extra_mode"] = "Incluir"
+    extra_filter_options_2 = ["Sin filtro"] + [
+        col for col in schema["categorical_cols"] if col != st.session_state[applied_key].get("extra_col", "Sin filtro")
+    ]
+    if st.session_state[applied_key].get("extra2_col") not in extra_filter_options_2:
+        st.session_state[applied_key]["extra2_col"] = "Sin filtro"
+    if st.session_state[applied_key].get("extra2_mode") not in ["Incluir", "Excluir"]:
+        st.session_state[applied_key]["extra2_mode"] = "Incluir"
     for key, value in default_temporal.items():
         draft_key = f"time_{key}_draft"
         if draft_key not in st.session_state:
@@ -2339,8 +2485,14 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
         st.session_state["time_value_col_draft"] = default_temporal["value_col"]
     if st.session_state.get("time_extra_col_draft") not in extra_filter_options:
         st.session_state["time_extra_col_draft"] = st.session_state[applied_key]["extra_col"]
+    extra_filter_options_2_draft = ["Sin filtro"] + [
+        col for col in schema["categorical_cols"] if col != st.session_state.get("time_extra_col_draft", "Sin filtro")
+    ]
+    if st.session_state.get("time_extra2_col_draft") not in extra_filter_options_2_draft:
+        st.session_state["time_extra2_col_draft"] = st.session_state[applied_key]["extra2_col"]
     with st.form(key="temporal_settings_form"):
-        c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 0.6])
+        top_cols = st.columns([1.1, 0.9, 1.1, 1.1, 0.9])
+        c1, c2, c3, c4, c5 = top_cols
         c1.selectbox("Fecha", options=schema["datetime_cols"], key="time_datetime_draft")
         c2.selectbox("Agrupacion", options=["D", "W", "M", "Q", "Y"], key="time_freq_draft")
         c3.selectbox("Metrica", options=["Cantidad de registros", "Agregado numerico"], key="time_metric_mode_draft")
@@ -2355,24 +2507,53 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
         else:
             c4.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
             c4.caption("La metrica sera el conteo de registros.")
+            c5.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
-        filter_cols = st.columns([1, 1.2, 0.7])
-        filter_cols[0].selectbox("Filtro categórico", options=extra_filter_options, key="time_extra_col_draft")
+        st.markdown("#### Filtros categóricos")
+        filter_row_1 = st.columns([1.1, 0.8, 1.5])
+        filter_row_1[0].selectbox("Filtro categórico", options=extra_filter_options, key="time_extra_col_draft")
         if st.session_state["time_extra_col_draft"] != "Sin filtro":
+            filter_row_1[1].selectbox("Modo", options=["Incluir", "Excluir"], key="time_extra_mode_draft")
             extra_values = sorted(df[st.session_state["time_extra_col_draft"]].dropna().astype(str).unique().tolist())
             current_extra_values = st.session_state.get("time_extra_values_draft", [])
             valid_extra_values = [value for value in current_extra_values if value in extra_values]
             if valid_extra_values != current_extra_values:
                 st.session_state["time_extra_values_draft"] = valid_extra_values
-            filter_cols[1].multiselect(
+            filter_row_1[2].multiselect(
                 f"Valores de {st.session_state['time_extra_col_draft']}",
                 options=extra_values,
                 key="time_extra_values_draft",
             )
         else:
+            st.session_state["time_extra_mode_draft"] = "Incluir"
             st.session_state["time_extra_values_draft"] = []
 
-        submitted = filter_cols[2].form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
+        extra_filter_options_2_form = ["Sin filtro"] + [
+            col for col in schema["categorical_cols"] if col != st.session_state["time_extra_col_draft"]
+        ]
+        if st.session_state.get("time_extra2_col_draft") not in extra_filter_options_2_form:
+            st.session_state["time_extra2_col_draft"] = "Sin filtro"
+
+        filter_row_2 = st.columns([1.1, 0.8, 1.5, 0.7])
+        filter_row_2[0].selectbox("Filtro categórico 2", options=extra_filter_options_2_form, key="time_extra2_col_draft")
+        if st.session_state["time_extra2_col_draft"] != "Sin filtro":
+            filter_row_2[1].selectbox("Modo 2", options=["Incluir", "Excluir"], key="time_extra2_mode_draft")
+            extra2_values = sorted(df[st.session_state["time_extra2_col_draft"]].dropna().astype(str).unique().tolist())
+            current_extra2_values = st.session_state.get("time_extra2_values_draft", [])
+            valid_extra2_values = [value for value in current_extra2_values if value in extra2_values]
+            if valid_extra2_values != current_extra2_values:
+                st.session_state["time_extra2_values_draft"] = valid_extra2_values
+            filter_row_2[2].multiselect(
+                f"Valores de {st.session_state['time_extra2_col_draft']}",
+                options=extra2_values,
+                key="time_extra2_values_draft",
+            )
+        else:
+            st.session_state["time_extra2_mode_draft"] = "Incluir"
+            st.session_state["time_extra2_values_draft"] = []
+
+        filter_row_2[3].markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+        submitted = filter_row_2[3].form_submit_button("Aplicar", use_container_width=True, on_click=trigger_loader)
     if submitted:
         st.session_state[applied_key] = {
             "datetime": st.session_state["time_datetime_draft"],
@@ -2381,7 +2562,11 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
             "value_col": st.session_state.get("time_value_col_draft"),
             "agg_func": st.session_state.get("time_agg_func_draft", "sum"),
             "extra_col": st.session_state.get("time_extra_col_draft", "Sin filtro"),
+            "extra_mode": st.session_state.get("time_extra_mode_draft", "Incluir"),
             "extra_values": tuple(st.session_state.get("time_extra_values_draft", [])),
+            "extra2_col": st.session_state.get("time_extra2_col_draft", "Sin filtro"),
+            "extra2_mode": st.session_state.get("time_extra2_mode_draft", "Incluir"),
+            "extra2_values": tuple(st.session_state.get("time_extra2_values_draft", [])),
         }
         st.rerun()
 
@@ -2393,7 +2578,17 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
     agg_func = applied_settings["agg_func"]
     temporal_df = df.copy()
     if applied_settings.get("extra_col") != "Sin filtro" and applied_settings.get("extra_values"):
-        temporal_df = temporal_df[temporal_df[applied_settings["extra_col"]].astype(str).isin(applied_settings["extra_values"])]
+        extra_mask = temporal_df[applied_settings["extra_col"]].astype(str).isin(applied_settings["extra_values"])
+        if applied_settings.get("extra_mode", "Incluir") == "Excluir":
+            temporal_df = temporal_df[~extra_mask]
+        else:
+            temporal_df = temporal_df[extra_mask]
+    if applied_settings.get("extra2_col") != "Sin filtro" and applied_settings.get("extra2_values"):
+        extra2_mask = temporal_df[applied_settings["extra2_col"]].astype(str).isin(applied_settings["extra2_values"])
+        if applied_settings.get("extra2_mode", "Incluir") == "Excluir":
+            temporal_df = temporal_df[~extra2_mask]
+        else:
+            temporal_df = temporal_df[extra2_mask]
 
     st.plotly_chart(
         fig_time_series_metric(temporal_df, datetime_col, freq, metric_mode, value_col, agg_func),
@@ -2411,7 +2606,7 @@ def render_temporal_tab(df: pd.DataFrame) -> None:
             metric_mode=metric_mode,
             value_col=value_col,
             agg_func=agg_func,
-            selected_values=tuple(applied_settings.get("extra_values", ())),
+            selected_values=tuple(applied_settings.get("extra_values", ())) if applied_settings.get("extra_mode", "Incluir") == "Incluir" else (),
         )
         if not breakdown_df.empty:
             metric_label = "Cantidad" if metric_mode == "Cantidad de registros" else f"{agg_func} de {value_col}"
